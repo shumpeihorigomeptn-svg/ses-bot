@@ -141,7 +141,8 @@ def build_app() -> App:
         channel = event.get("channel")
         message_ts = event.get("ts")
         files = event.get("files") or []
-
+        
+        text = text.replace("\n", "")
         fields = extract_request_fields(text)
         logger.info("抽出結果: user=%s fields=%s", user, fields)
 
