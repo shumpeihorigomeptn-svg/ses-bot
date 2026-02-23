@@ -1,3 +1,13 @@
-slack_bolt>=1.18.0
+slack_bolt>=1.27.0
+Flask>=3.0.0
 python-dotenv>=1.0.1
-requests>=2.31.0
+requests>=2.32.0
+openai>=1.60.0
+pypdf>=4.3.0
+supabase>=2.4.0
+postgrest>=0.16.0
+fastapi>=0.115.0
+pydantic>=2.8.0
+bcrypt>=4.1.2
+PyJWT>=2.9.0
+google-cloud-storage>=2.16.0

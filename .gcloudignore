@@ -1,0 +1,7 @@
+# gcloud 用の無視設定。ここでは .env を除外しない。
+# .gitignore は参照しないので必要なものだけ列挙する。
+.git
+.gitignore
+venv/
+__pycache__/
+*.pyc
