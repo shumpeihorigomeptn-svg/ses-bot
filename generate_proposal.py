@@ -6,11 +6,13 @@ import os
 import re
 import time
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, unquote, urlparse
 
+import psycopg2
 from dotenv import load_dotenv
+from psycopg2 import sql
+from psycopg2.extras import Json, RealDictCursor
 from pypdf import PdfReader
-from postgrest import APIError as PostgrestAPIError
-from supabase import Client, create_client
 
 try:
     from fastapi import UploadFile
@@ -29,141 +31,217 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-_client: Optional[Client] = None
+DEFAULT_DATABASE_URL = (
+    "postgresql+psycopg2://postgres:SpeeeOnishiPass1234@/ses-ai"
+    "?host=/cloudsql/ses-ainize:asia-northeast1:ses-ai"
+)
+_db_connect_kwargs: Optional[Dict[str, Any]] = None
 
 
-def _get_client() -> Client:
-    global _client
-    if _client is not None:
-        return _client
-    if not SUPABASE_URL:
-        raise RuntimeError("SUPABASE_URL が設定されていません")
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY が設定されていません")
-    _client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    return _client
+def _get_db_connect_kwargs() -> Dict[str, Any]:
+    global _db_connect_kwargs
+    if _db_connect_kwargs is not None:
+        return _db_connect_kwargs
+
+    database_url = (os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL).strip()
+    if not database_url:
+        raise RuntimeError("DATABASE_URL が設定されていません")
+
+    normalized_url = database_url
+    if normalized_url.startswith("postgresql+psycopg2://"):
+        normalized_url = normalized_url.replace("postgresql+psycopg2://", "postgresql://", 1)
+
+    parsed = urlparse(normalized_url)
+    dbname = (parsed.path or "").lstrip("/")
+    if not dbname:
+        raise RuntimeError("DATABASE_URL にデータベース名が含まれていません")
+
+    query_params = parse_qs(parsed.query or "")
+    host = (query_params.get("host") or [parsed.hostname])[0]
+    if not host:
+        raise RuntimeError("DATABASE_URL に host が含まれていません")
+
+    kwargs: Dict[str, Any] = {"dbname": dbname, "host": host}
+    if parsed.username:
+        kwargs["user"] = unquote(parsed.username)
+    if parsed.password is not None:
+        kwargs["password"] = unquote(parsed.password)
+
+    port_value = (query_params.get("port") or [parsed.port])[0]
+    if port_value is not None and str(port_value) != "":
+        try:
+            kwargs["port"] = int(port_value)
+        except (TypeError, ValueError):
+            kwargs["port"] = port_value
+
+    for key, values in query_params.items():
+        if key in {"host", "port"} or not values:
+            continue
+        kwargs[key] = values[0]
+
+    _db_connect_kwargs = kwargs
+    return _db_connect_kwargs
+
+
+def _adapt_db_value(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return Json(value)
+    return value
+
+
+def _db_fetch_one(query: Any, params: tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
+    with psycopg2.connect(**_get_db_connect_kwargs()) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _db_insert_returning(table_name: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not payload:
+        raise ValueError("payload is empty")
+    columns = list(payload.keys())
+    values = [_adapt_db_value(payload[col]) for col in columns]
+    query = sql.SQL("INSERT INTO {table} ({columns}) VALUES ({values}) RETURNING *").format(
+        table=sql.Identifier(table_name),
+        columns=sql.SQL(", ").join(sql.Identifier(col) for col in columns),
+        values=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+    )
+    return _db_fetch_one(query, tuple(values))
+
+
+def _db_update_returning(
+    table_name: str,
+    key_column: str,
+    key_value: Any,
+    payload: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not payload:
+        raise ValueError("payload is empty")
+    columns = list(payload.keys())
+    assignments = sql.SQL(", ").join(
+        sql.SQL("{} = {}").format(sql.Identifier(col), sql.Placeholder()) for col in columns
+    )
+    values = [_adapt_db_value(payload[col]) for col in columns]
+    query = sql.SQL("UPDATE {table} SET {assignments} WHERE {key} = %s RETURNING *").format(
+        table=sql.Identifier(table_name),
+        assignments=assignments,
+        key=sql.Identifier(key_column),
+    )
+    return _db_fetch_one(query, tuple(values + [key_value]))
 
 
 def _get_case_id_from_number(case_num: int) -> str:
-    client = _get_client()
     try:
-        result = (
-            client.table("CaseManagement")
-            .select("id")
-            .eq("number", case_num)
-            .limit(1)
-            .execute()
+        row = _db_fetch_one(
+            """
+            SELECT id
+            FROM "CaseManagement"
+            WHERE number = %s
+            LIMIT 1
+            """,
+            (case_num,),
         )
-    except PostgrestAPIError as exc:
-        raise RuntimeError(f"Supabase CaseManagement 取得に失敗しました: {exc}") from exc
-    rows = result.data or []
-    if not rows:
+    except Exception as exc:
+        raise RuntimeError(f"CaseManagement 取得に失敗しました: {exc}") from exc
+    if not row:
         raise RuntimeError(f"CaseManagement が見つかりません: case_num={case_num}")
-    return rows[0]["id"]
+    return str(row["id"])
 
 
 def _get_case_summary(case_id: str) -> str:
-    client = _get_client()
     try:
-        result = (
-            client.table("CaseManagement")
-            .select("case_summary")
-            .eq("id", case_id)
-            .limit(1)
-            .execute()
+        row = _db_fetch_one(
+            """
+            SELECT case_summary
+            FROM "CaseManagement"
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (case_id,),
         )
-    except PostgrestAPIError as exc:
-        raise RuntimeError(f"Supabase CaseManagement 取得に失敗しました: {exc}") from exc
-    rows = result.data or []
-    if not rows:
+    except Exception as exc:
+        raise RuntimeError(f"CaseManagement 取得に失敗しました: {exc}") from exc
+    if not row:
         raise RuntimeError(f"CaseManagement が見つかりません: id={case_id}")
-    return rows[0]["case_summary"]
+    return row.get("case_summary") or ""
 
 
 def get_case_user_name_by_number(case_num: int) -> Optional[str]:
-    client = _get_client()
     try:
-        result = (
-            client.table("CaseManagement")
-            .select("user_name")
-            .eq("number", case_num)
-            .limit(1)
-            .execute()
+        row = _db_fetch_one(
+            """
+            SELECT user_name
+            FROM "CaseManagement"
+            WHERE number = %s
+            LIMIT 1
+            """,
+            (case_num,),
         )
-    except PostgrestAPIError as exc:
-        raise RuntimeError(f"Supabase CaseManagement 取得に失敗しました: {exc}") from exc
-    rows = result.data or []
-    if not rows:
+    except Exception as exc:
+        raise RuntimeError(f"CaseManagement 取得に失敗しました: {exc}") from exc
+    if not row:
         return None
-    return rows[0].get("user_name")
+    return row.get("user_name")
 
 
 def _insert_proposal_record(payload: Dict[str, Any]) -> Dict[str, Any]:
-    client = _get_client()
     try:
-        result = client.table("Proposal").insert(payload).execute()
-    except PostgrestAPIError as exc:
+        row = _db_insert_returning("Proposal", payload)
+    except Exception as exc:
         raise RuntimeError(f"Proposal への登録に失敗しました: {exc}") from exc
-    rows = result.data or []
-    if not rows:
+    if not row:
         raise RuntimeError("Proposal 追加結果が空です")
-    return rows[0]
+    return row
 
 
 def _update_proposal_record(proposal_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    client = _get_client()
     try:
-        result = client.table("Proposal").update(payload).eq("id", proposal_id).execute()
-    except PostgrestAPIError as exc:
+        row = _db_update_returning("Proposal", "id", proposal_id, payload)
+    except Exception as exc:
         raise RuntimeError(f"Proposal 更新に失敗しました: {exc}") from exc
-    rows = result.data or []
-    if not rows:
+    if not row:
         raise RuntimeError("Proposal 更新結果が空です")
-    return rows[0]
+    return row
 
 
 def _get_bp_id_by_slack_channel(slack_channel_id: str) -> Optional[str]:
-    client = _get_client()
     try:
-        result = (
-            client.table("Bp")
-            .select("id")
-            .eq("slack_channel_id", slack_channel_id)
-            .limit(1)
-            .execute()
+        row = _db_fetch_one(
+            """
+            SELECT id
+            FROM "Bp"
+            WHERE slack_channel_id = %s
+            LIMIT 1
+            """,
+            (slack_channel_id,),
         )
-    except PostgrestAPIError as exc:
+    except Exception as exc:
         raise RuntimeError(f"Bp 取得に失敗しました: {exc}") from exc
-    rows = result.data or []
-    if rows:
-        return rows[0]["id"]
-    return None
+    return str(row["id"]) if row else None
 
 
 def _get_proposal_count_by_case(case_id: str) -> int:
-    client = _get_client()
     last_exc: Optional[Exception] = None
     for attempt in range(3):
         try:
-            result = (
-                client.table("Proposal")
-                .select("id", count="exact")
-                .eq("case_id", case_id)
-                .execute()
+            row = _db_fetch_one(
+                """
+                SELECT COUNT(*)::int AS count
+                FROM "Proposal"
+                WHERE case_id = %s
+                """,
+                (case_id,),
             )
             last_exc = None
-            break
-        except PostgrestAPIError as exc:
+            return int((row or {}).get("count") or 0)
+        except Exception as exc:
             last_exc = exc
             logger.warning("Proposal 件数取得に失敗しました (retry %d/3): %s", attempt + 1, exc)
             time.sleep(1 + attempt)
     if last_exc is not None:
         raise RuntimeError(f"Proposal 件数取得に失敗しました: {last_exc}") from last_exc
-    if result.count is not None:
-        return result.count
-    return len(result.data or [])
+    return 0
 
 
 def _extract_skill_sheet_text(skill_sheet: Optional[UploadFile]) -> str:

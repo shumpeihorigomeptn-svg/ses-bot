@@ -5,17 +5,17 @@ import logging
 import os
 import re
 import threading
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from types import SimpleNamespace
 from typing import Any
 
+import psycopg2
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request
-from postgrest import APIError as PostgrestAPIError
+from psycopg2.extras import RealDictCursor
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
-from supabase import Client, create_client
 from generate_proposal import (
     generate_proposal as generate_proposal_internal,
     get_case_user_name_by_number,
@@ -31,7 +31,11 @@ USER_LIST = {
     "山田": "U099D00B78B",
     "堀越": "U09J0DN3BHA",
 }
-_supabase_client: Client | None = None
+DEFAULT_DATABASE_URL = (
+    "postgresql+psycopg2://postgres:SpeeeOnishiPass1234@/ses-ai"
+    "?host=/cloudsql/ses-ainize:asia-northeast1:ses-ai"
+)
+_db_connect_kwargs: dict[str, Any] | None = None
 
 
 def _clean_lines(text: str) -> list[str]:
@@ -250,99 +254,149 @@ def _build_bp_decision_message(
     return message
 
 
-def _get_supabase_client() -> Client:
-    global _supabase_client
-    if _supabase_client is not None:
-        return _supabase_client
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    if not supabase_url or not supabase_key:
-        raise RuntimeError("SUPABASE_URL と SUPABASE_SERVICE_ROLE_KEY を設定してください。")
-    _supabase_client = create_client(supabase_url, supabase_key)
-    return _supabase_client
+def _get_db_connect_kwargs() -> dict[str, Any]:
+    global _db_connect_kwargs
+    if _db_connect_kwargs is not None:
+        return _db_connect_kwargs
+
+    database_url = (os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL).strip()
+    if not database_url:
+        raise RuntimeError("DATABASE_URL を設定してください。")
+
+    normalized_url = database_url
+    if normalized_url.startswith("postgresql+psycopg2://"):
+        normalized_url = normalized_url.replace("postgresql+psycopg2://", "postgresql://", 1)
+
+    parsed = urlparse(normalized_url)
+    dbname = (parsed.path or "").lstrip("/")
+    if not dbname:
+        raise RuntimeError("DATABASE_URL にデータベース名が含まれていません。")
+
+    query_params = parse_qs(parsed.query or "")
+    host = (query_params.get("host") or [parsed.hostname])[0]
+    if not host:
+        raise RuntimeError("DATABASE_URL に host が含まれていません。")
+
+    kwargs: dict[str, Any] = {
+        "dbname": dbname,
+        "host": host,
+    }
+    if parsed.username:
+        kwargs["user"] = unquote(parsed.username)
+    if parsed.password is not None:
+        kwargs["password"] = unquote(parsed.password)
+
+    port_value = (query_params.get("port") or [parsed.port])[0]
+    if port_value is not None and str(port_value) != "":
+        try:
+            kwargs["port"] = int(port_value)
+        except (TypeError, ValueError):
+            kwargs["port"] = port_value
+
+    for key, values in query_params.items():
+        if key in {"host", "port"} or not values:
+            continue
+        kwargs[key] = values[0]
+
+    _db_connect_kwargs = kwargs
+    return _db_connect_kwargs
+
+
+def _db_fetch_one(sql: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
+    with psycopg2.connect(**_get_db_connect_kwargs()) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _db_execute(sql: str, params: tuple[Any, ...]) -> int:
+    with psycopg2.connect(**_get_db_connect_kwargs()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            row_count = cur.rowcount
+    return row_count
 
 
 def _fetch_proposal_by_code(proposal_code: str) -> dict[str, Any] | None:
-    client = _get_supabase_client()
     try:
-        result = (
-            client.table("Proposal")
-            .select("id, case_id, candidate_initials, interview_schedule_url")
-            .eq("proposal_code", proposal_code)
-            .limit(1)
-            .execute()
+        return _db_fetch_one(
+            """
+            SELECT id, case_id, candidate_initials, interview_schedule_url
+            FROM "Proposal"
+            WHERE proposal_code = %s
+            LIMIT 1
+            """,
+            (proposal_code,),
         )
-    except PostgrestAPIError as exc:
+    except Exception as exc:
         raise RuntimeError(f"Proposal の取得に失敗しました: {exc}") from exc
-    rows = result.data or []
-    return rows[0] if rows else None
 
 
 def _fetch_case_by_id(case_id: str) -> dict[str, Any] | None:
-    client = _get_supabase_client()
     try:
-        result = (
-            client.table("CaseManagement")
-            .select("id, user_id, user_name, client_id")
-            .eq("id", case_id)
-            .limit(1)
-            .execute()
+        return _db_fetch_one(
+            """
+            SELECT id, user_id, user_name, client_id
+            FROM "CaseManagement"
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (case_id,),
         )
-    except PostgrestAPIError as exc:
+    except Exception as exc:
         raise RuntimeError(f"CaseManagement の取得に失敗しました: {exc}") from exc
-    rows = result.data or []
-    return rows[0] if rows else None
 
 
 def _fetch_user_name_by_id(user_id: str) -> str | None:
-    client = _get_supabase_client()
     try:
-        result = (
-            client.table("User")
-            .select("id, user_name")
-            .eq("id", user_id)
-            .limit(1)
-            .execute()
+        row = _db_fetch_one(
+            """
+            SELECT id, user_name
+            FROM "User"
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (user_id,),
         )
-    except PostgrestAPIError as exc:
+    except Exception as exc:
         raise RuntimeError(f"User の取得に失敗しました: {exc}") from exc
-    rows = result.data or []
-    if not rows:
+    if not row:
         return None
-    return rows[0].get("user_name")
+    return row.get("user_name")
 
 
 def _fetch_client_name_by_id(client_id: str) -> str | None:
-    client = _get_supabase_client()
     try:
-        result = (
-            client.table("Clients")
-            .select("id, client_name")
-            .eq("id", client_id)
-            .limit(1)
-            .execute()
+        row = _db_fetch_one(
+            """
+            SELECT id, client_name
+            FROM "Clients"
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (client_id,),
         )
-    except PostgrestAPIError as exc:
+    except Exception as exc:
         raise RuntimeError(f"Clients の取得に失敗しました: {exc}") from exc
-    rows = result.data or []
-    if not rows:
+    if not row:
         return None
-    return rows[0].get("client_name")
+    return row.get("client_name")
 
 
 def _update_interview_schedule_url_by_code(proposal_code: str, interview_schedule_url: str) -> None:
-    client = _get_supabase_client()
     try:
-        result = (
-            client.table("Proposal")
-            .update({"interview_schedule_url": interview_schedule_url})
-            .eq("proposal_code", proposal_code)
-            .execute()
+        updated_count = _db_execute(
+            """
+            UPDATE "Proposal"
+            SET interview_schedule_url = %s
+            WHERE proposal_code = %s
+            """,
+            (interview_schedule_url, proposal_code),
         )
-    except PostgrestAPIError as exc:
+    except Exception as exc:
         raise RuntimeError(f"Proposal の更新に失敗しました: {exc}") from exc
-    rows = result.data or []
-    if not rows:
+    if updated_count <= 0:
         raise RuntimeError("Proposal の更新結果が空です")
 
 

@@ -1,32 +1,67 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
 import os
+from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, unquote, urlparse
+
+import psycopg2
 from dotenv import load_dotenv
+from psycopg2.extras import RealDictCursor
+
 load_dotenv(".env")
 
-from postgrest import APIError as PostgrestAPIError
-from typing import Any, Dict, Optional
-
-from supabase import Client, create_client
-
 logger = logging.getLogger(__name__)
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-_client: Optional[Client] = None
+DEFAULT_DATABASE_URL = (
+    "postgresql+psycopg2://postgres:SpeeeOnishiPass1234@/ses-ai"
+    "?host=/cloudsql/ses-ainize:asia-northeast1:ses-ai"
+)
+_db_connect_kwargs: Optional[Dict[str, Any]] = None
 
 
-def _get_client() -> Client:
-    global _client
-    if _client is not None:
-        return _client
-    if not SUPABASE_URL:
-        raise RuntimeError("SUPABASE_URL が設定されていません")
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY が設定されていません")
-    _client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    return _client
+def _get_db_connect_kwargs() -> Dict[str, Any]:
+    global _db_connect_kwargs
+    if _db_connect_kwargs is not None:
+        return _db_connect_kwargs
+
+    database_url = (os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL).strip()
+    if not database_url:
+        raise RuntimeError("DATABASE_URL が設定されていません")
+
+    normalized_url = database_url
+    if normalized_url.startswith("postgresql+psycopg2://"):
+        normalized_url = normalized_url.replace("postgresql+psycopg2://", "postgresql://", 1)
+
+    parsed = urlparse(normalized_url)
+    dbname = (parsed.path or "").lstrip("/")
+    if not dbname:
+        raise RuntimeError("DATABASE_URL にデータベース名が含まれていません")
+
+    query_params = parse_qs(parsed.query or "")
+    host = (query_params.get("host") or [parsed.hostname])[0]
+    if not host:
+        raise RuntimeError("DATABASE_URL に host が含まれていません")
+
+    kwargs: Dict[str, Any] = {"dbname": dbname, "host": host}
+    if parsed.username:
+        kwargs["user"] = unquote(parsed.username)
+    if parsed.password is not None:
+        kwargs["password"] = unquote(parsed.password)
+
+    port_value = (query_params.get("port") or [parsed.port])[0]
+    if port_value is not None and str(port_value) != "":
+        try:
+            kwargs["port"] = int(port_value)
+        except (TypeError, ValueError):
+            kwargs["port"] = port_value
+
+    for key, values in query_params.items():
+        if key in {"host", "port"} or not values:
+            continue
+        kwargs[key] = values[0]
+
+    _db_connect_kwargs = kwargs
+    return _db_connect_kwargs
 
 PROMPT_ID = 1
 _PROMPT_KEYS = (
@@ -39,26 +74,18 @@ _PROMPT_KEYS = (
 
 def _fetch_prompt_row(prompt_id: int) -> Dict[str, Any]:
     try:
-        client = _get_client()
-        result = (
-            client.table("Prompt")
-            .select("*")
-            .eq("id", prompt_id)
-            .limit(1)
-            .execute()
-        )
-    except PostgrestAPIError as exc:
-        logger.warning("Prompt テーブル取得に失敗しました: %s", exc)
-        return {}
+        with psycopg2.connect(**_get_db_connect_kwargs()) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute('SELECT * FROM "Prompt" WHERE id = %s LIMIT 1', (prompt_id,))
+                row = cur.fetchone()
     except Exception as exc:  # pragma: no cover - 実行環境依存
         logger.warning("Prompt 取得時に想定外のエラー: %s", exc)
         return {}
 
-    rows = result.data or []
-    if not rows:
+    if not row:
         logger.warning("Prompt に id=%s のレコードが見つかりません", prompt_id)
         return {}
-    return rows[0]
+    return dict(row)
 
 
 def _get_prompt_values() -> Dict[str, str]:
