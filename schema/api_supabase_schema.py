@@ -213,6 +213,7 @@ class ProposalRecord(BaseModel):
     # 営業担当が入力
     speee_decision: Optional[str] = Field(None, description="Speee 提案/見送り（proposal/decline/undecided）")
     handler: Optional[str] = Field(None, description="対応者（ログイン情報で自動化可）")
+    proposal_bp_handler: Optional[str] = Field(None, description="BP側担当者")
     document_examination: Optional[str] = Field(None, description="書類選考結果")
     first_interview: Optional[str] = Field(None, description="1次面談結果")
     final_interview: Optional[str] = Field(None, description="最終面談結果")
@@ -252,6 +253,7 @@ class ProposalCreateRequest(BaseModel):
     proposal_status: Optional[bool] = Field(None, description="提案するかどうか")
     speee_decision: Optional[str] = Field(None, description="Speee 提案/見送り（proposal/decline/undecided）")
     handler: Optional[str] = Field(None, description="対応者（ログイン情報で自動化可）")
+    proposal_bp_handler: Optional[str] = Field(None, description="BP側担当者")
     document_examination: Optional[str] = Field(None, description="書類選考結果")
     first_interview: Optional[str] = Field(None, description="1次面談結果")
     final_interview: Optional[str] = Field(None, description="最終面談結果")
@@ -291,6 +293,7 @@ class ProposalUpdateRequest(BaseModel):
     proposal_status: Optional[bool] = Field(None, description="提案するかどうか")
     speee_decision: Optional[str] = Field(None, description="Speee 提案/見送り（proposal/decline/undecided）")
     handler: Optional[str] = Field(None, description="対応者")
+    proposal_bp_handler: Optional[str] = Field(None, description="BP側担当者")
     document_examination: Optional[str] = Field(None, description="書類選考結果")
     first_interview: Optional[str] = Field(None, description="1次面談結果")
     final_interview: Optional[str] = Field(None, description="最終面談結果")

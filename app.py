@@ -24,6 +24,7 @@ from generate_proposal import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 DOWNLOAD_DIR = "downloaded_files"
+ALLOWED_CORS_ORIGINS = {"http://localhost:3000", "http://34.111.248.15"}
 USER_LIST = {
     "大西": "U05CP9LLACX",
     "上水流": "U05QS9W48G1",
@@ -41,6 +42,62 @@ _db_connect_kwargs: dict[str, Any] | None = None
 def _clean_lines(text: str) -> list[str]:
     without_mentions = re.sub(r"<@[^>]+>", "", text)
     return [line.strip() for line in without_mentions.splitlines() if line.strip()]
+
+
+def _extract_user_mentions_from_blocks(elements: list[dict[str, Any]] | None) -> list[str]:
+    mentions: list[str] = []
+    if not elements:
+        return mentions
+
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+
+        if element.get("type") == "user":
+            user_id = (element.get("user_id") or "").strip()
+            if user_id:
+                mentions.append(user_id)
+
+        child_elements = element.get("elements")
+        if isinstance(child_elements, list):
+            mentions.extend(_extract_user_mentions_from_blocks(child_elements))
+
+    return mentions
+
+
+def _extract_bp_handler_user_id(
+    text: str,
+    blocks: list[dict[str, Any]] | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    text_mentions = re.findall(r"<@([A-Z0-9]+)(?:\|[^>]+)?>", text or "")
+    block_mentions = _extract_user_mentions_from_blocks(blocks)
+
+    combined_mentions: list[str] = []
+    for mention_id in text_mentions + block_mentions:
+        if mention_id and mention_id not in combined_mentions:
+            combined_mentions.append(mention_id)
+
+    debug_info: dict[str, Any] = {
+        "text_preview": (text or "")[:300],
+        "text_mentions": text_mentions,
+        "block_mentions": block_mentions,
+        "combined_mentions": combined_mentions,
+        "block_count": len(blocks or []),
+    }
+
+    if len(combined_mentions) < 2:
+        debug_info["reason"] = "bot以外のメンション候補が見つかるほどメンション数がありません"
+        return None, debug_info
+
+    app_mention_id = combined_mentions[0]
+    debug_info["app_mention_id"] = app_mention_id
+    selected_handler_id = next((mention_id for mention_id in combined_mentions[1:] if mention_id != app_mention_id), None)
+    if not selected_handler_id:
+        debug_info["reason"] = "2件目以降のメンションが bot と同一のため BP 担当者を特定できません"
+        return None, debug_info
+
+    debug_info["selected_handler_id"] = selected_handler_id
+    return selected_handler_id, debug_info
 
 
 def _extract_section(text: str, keywords: list[str], stop_keywords: list[str]) -> str | None:
@@ -310,6 +367,14 @@ def _db_fetch_one(sql: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def _db_fetch_all(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+    with psycopg2.connect(**_get_db_connect_kwargs()) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+    return [dict(row) for row in rows]
+
+
 def _db_execute(sql: str, params: tuple[Any, ...]) -> int:
     with psycopg2.connect(**_get_db_connect_kwargs()) as conn:
         with conn.cursor() as cur:
@@ -337,7 +402,7 @@ def _fetch_case_by_id(case_id: str) -> dict[str, Any] | None:
     try:
         return _db_fetch_one(
             """
-            SELECT id, user_id, user_name, client_id
+            SELECT id, user_id, user_name, client_id, number, case_name
             FROM "CaseManagement"
             WHERE id = %s
             LIMIT 1
@@ -382,6 +447,28 @@ def _fetch_client_name_by_id(client_id: str) -> str | None:
     if not row:
         return None
     return row.get("client_name")
+
+
+def _fetch_proposals_by_case_id(case_id: str) -> list[dict[str, Any]]:
+    try:
+        return _db_fetch_all(
+            """
+            SELECT
+                id,
+                bp_id,
+                bp_link,
+                proposal_link,
+                proposal_bp_handler,
+                created_at,
+                updated_at
+            FROM "Proposal"
+            WHERE case_id = %s
+            ORDER BY created_at DESC NULLS LAST, updated_at DESC NULLS LAST, id DESC
+            """,
+            (case_id,),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Proposal 一覧の取得に失敗しました: {exc}") from exc
 
 
 def _update_interview_schedule_url_by_code(proposal_code: str, interview_schedule_url: str) -> None:
@@ -513,6 +600,41 @@ def _build_proposal_update_thread_text(
     )
 
 
+def _build_proposal_update_parent_text(
+    *,
+    case_number: Any,
+    case_name: str | None,
+    candidate_initial: str,
+) -> str:
+    number_text = str(case_number).strip() if case_number is not None else ""
+    case_name_text = (case_name or "").strip()
+    candidate_initial_text = (candidate_initial or "").strip()
+    candidate_label = f"{candidate_initial_text}さん" if candidate_initial_text else "候補者さん"
+
+    case_parts = []
+    if number_text:
+        case_parts.append(f"No.{number_text}")
+    if case_name_text:
+        case_parts.append(case_name_text)
+    case_label = " ".join(case_parts) or "案件情報未設定"
+
+    if not candidate_initial_text:
+        number_label = f"案件No{number_text}" if number_text else "案件No未設定"
+        if case_name_text:
+            case_context = f"{number_label}の{case_name_text}"
+        else:
+            case_context = f"{number_label}の案件"
+        return (
+            f"{case_context}でご提案いただいた、提案者さんに面談依頼をいただきました！\n"
+            "こちらのスレッドで日程調整など進めさせていください。"
+        )
+
+    return (
+        f"{case_label}でご提案いただいた{candidate_label}に面談依頼をいただきました！\n"
+        "こちらのスレッドで日程調整など進めさせていください。"
+    )
+
+
 def _build_proposal_detail_update_text(
     *,
     candidate_initial: str,
@@ -532,6 +654,94 @@ def _build_proposal_detail_update_text(
     )
 
 
+def _get_announcement_thread_link(proposal_row: dict[str, Any]) -> str | None:
+    return (
+        (proposal_row.get("bp_link") or "").strip()
+        or (proposal_row.get("proposal_link") or "").strip()
+        or None
+    )
+
+
+def _get_proposal_group_key(proposal_row: dict[str, Any]) -> str:
+    bp_id = proposal_row.get("bp_id")
+    if bp_id:
+        return f"bp:{bp_id}"
+
+    link = _get_announcement_thread_link(proposal_row)
+    if link:
+        channel_id, _ = _parse_slack_permalink(link)
+        if channel_id:
+            return f"channel:{channel_id}"
+
+    return f"proposal:{proposal_row.get('id')}"
+
+
+def _collect_handler_mentions(proposal_rows: list[dict[str, Any]]) -> list[str]:
+    mentions: list[str] = []
+    seen: set[str] = set()
+
+    for row in proposal_rows:
+        handler_id = (row.get("proposal_bp_handler") or "").strip()
+        if not handler_id or handler_id in seen:
+            continue
+        seen.add(handler_id)
+        mentions.append(handler_id)
+
+    return mentions
+
+
+def _pick_latest_thread_context(proposal_rows: list[dict[str, Any]]) -> tuple[str | None, str | None, str | None]:
+    for row in proposal_rows:
+        link = _get_announcement_thread_link(row)
+        if not link:
+            continue
+        channel_id, thread_ts = _parse_slack_permalink(link)
+        if channel_id and thread_ts:
+            return channel_id, thread_ts, link
+    return None, None, None
+
+
+def _normalize_optional_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return value.strip() if isinstance(value, str) else str(value).strip()
+
+
+def _build_close_comment_block(comment_text: str) -> str:
+    if not comment_text:
+        return ""
+    return f"【追加メッセージ】\n{comment_text}"
+
+
+def _build_project_close_message(
+    *,
+    case_number: Any,
+    case_name: str | None,
+    mention_ids: list[str],
+    close_comment: str = "",
+) -> str:
+    case_number_text = str(case_number).strip() if case_number is not None else ""
+    case_name_text = (case_name or "").strip()
+    case_label = f"No.{case_number_text}" if case_number_text else "該当案件"
+    if case_name_text:
+        case_label = f"{case_label}の{case_name_text}案件"
+
+    lines: list[str] = []
+    if mention_ids:
+        lines.append(" ".join(f"<@{mention_id}>" for mention_id in mention_ids))
+    lines.extend(
+        [
+            f"{case_label}にご提案をいただきありがとうございます。",
+            "こちらの案件につきましては、募集終了となった旨、ご連絡いたします。",
+            *([_build_close_comment_block(close_comment)] if close_comment else []),
+            "ご対応ありがとうございました。",
+            "",
+            "他の案件にて、引き続きよろしくお願いいたします！",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def build_app() -> App:
     load_dotenv()  # .envから環境変数を読み込む
     bot_token = os.environ.get("SLACK_BOT_TOKEN")
@@ -546,13 +756,25 @@ def build_app() -> App:
     def handle_app_mention(event, say):
         logger.info("app_mention を受信: %s", event)
         thread_ts = event.get("thread_ts") or event.get("ts")
-        text = event.get("text") or ""
+        raw_text = event.get("text") or ""
+        blocks = event.get("blocks") or []
         user = event.get("user")
         channel = event.get("channel")
         message_ts = event.get("ts")
         files = event.get("files") or []
         logger.info("添付ファイル数: %d", len(files))
-        
+
+        proposal_bp_handler, bp_handler_debug = _extract_bp_handler_user_id(raw_text, blocks)
+        logger.info(
+            "BP担当者メンション抽出: user=%s proposal_bp_handler=%s debug=%s",
+            user,
+            proposal_bp_handler,
+            bp_handler_debug,
+        )
+        if not proposal_bp_handler:
+            logger.warning("proposal_bp_handler を抽出できませんでした: event_text=%r", raw_text)
+
+        text = raw_text
         text = text.replace("\n", "").replace("*", "")
         fields = extract_request_fields(text)
         logger.info("抽出結果: user=%s fields=%s", user, fields)
@@ -615,11 +837,18 @@ def build_app() -> App:
             upload_file = _to_upload_file(skill_sheet)
 
             try:
+                logger.info(
+                    "generate_proposal 呼び出し前: case_num=%s proposal_bp_handler=%s proposal_bp_handler_debug=%s",
+                    case_num_int,
+                    proposal_bp_handler,
+                    bp_handler_debug,
+                )
                 api_resp = generate_proposal_internal(
                     case_num=case_num_int,
                     candidate_profiles=fields["提案内容"] or "",
                     proposal_link=permalink,
                     skill_sheet=upload_file,
+                    proposal_bp_handler=proposal_bp_handler,
                 )
                 status = getattr(api_resp, "status", None) or getattr(api_resp, "get", lambda k: None)("status")
                 proposal_id = getattr(api_resp, "proposal_id", None) or getattr(api_resp, "get", lambda k: None)(
@@ -644,6 +873,16 @@ def main() -> None:
     app = build_app()
     flask_app = Flask(__name__)
     handler = SlackRequestHandler(app)
+
+    @flask_app.after_request
+    def add_cors_headers(response):
+        origin = (request.headers.get("Origin") or "").strip()
+        if origin in ALLOWED_CORS_ORIGINS:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Vary"] = "Origin"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return response
 
     @flask_app.route("/slack/events", methods=["POST"])
     def slack_events():
@@ -788,7 +1027,12 @@ def main() -> None:
                 "error": "bp_link からチャンネルを判定できません。bp_channel_id または BP_CHANNEL_ID を指定してください。",
             }, 400
 
-        parent_text = (payload.get("parent_text") or "面談日程調整のスレッドを作成しました。").strip()
+        default_parent_text = _build_proposal_update_parent_text(
+            case_number=case_row.get("number"),
+            case_name=case_row.get("case_name"),
+            candidate_initial=candidate_initial,
+        )
+        parent_text = (payload.get("parent_text") or default_parent_text).strip()
         default_thread_text = _build_proposal_update_thread_text(
             bp_link=bp_link,
             candidate_initial=candidate_initial,
@@ -890,6 +1134,110 @@ def main() -> None:
             "thread_ts": thread_ts,
             "ts": resp.get("ts"),
             "interview_schedule_url": interview_schedule_url,
+        }, 200
+
+    @flask_app.route("/speee-project-announcement", methods=["POST"])
+    def speee_project_announcement():
+        payload = request.get_json(silent=True) or {}
+        if not payload:
+            return {"error": "JSONボディが必要です"}, 400
+
+        status = (payload.get("status") or "").strip().lower()
+        project_id = (payload.get("project_id") or "").strip()
+        close_comment = _normalize_optional_text(payload.get("text"))
+
+        if status not in {"open", "close"}:
+            return {"error": "status は open または close を指定してください"}, 400
+        if not project_id:
+            return {"error": "project_id は必須です"}, 400
+
+        if status == "open":
+            return {"status": "no_action", "reason": "open ステータスでは通知を送信しません"}, 200
+
+        try:
+            case_row = _fetch_case_by_id(project_id)
+        except Exception as exc:
+            logger.exception("CaseManagement の取得に失敗しました: %s", exc)
+            return {"error": "CaseManagement の取得に失敗しました"}, 500
+
+        if not case_row:
+            return {"error": "project_id に一致する CaseManagement が見つかりません"}, 404
+
+        try:
+            proposal_rows = _fetch_proposals_by_case_id(project_id)
+        except Exception as exc:
+            logger.exception("Proposal 一覧の取得に失敗しました: %s", exc)
+            return {"error": "Proposal 一覧の取得に失敗しました"}, 500
+
+        if not proposal_rows:
+            return {"status": "no_action", "reason": "対象案件に Proposal がありません", "project_id": project_id}, 200
+
+        grouped_rows: dict[str, list[dict[str, Any]]] = {}
+        for row in proposal_rows:
+            grouped_rows.setdefault(_get_proposal_group_key(row), []).append(row)
+
+        sent_count = 0
+        skipped_groups: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
+
+        for group_key, rows in grouped_rows.items():
+            mention_ids = _collect_handler_mentions(rows)
+            channel_id, thread_ts, thread_link = _pick_latest_thread_context(rows)
+            if not channel_id or not thread_ts:
+                skipped_groups.append(
+                    {
+                        "group_key": group_key,
+                        "reason": "最新提案スレッドを特定できません",
+                    }
+                )
+                continue
+
+            message = _build_project_close_message(
+                case_number=case_row.get("number"),
+                case_name=case_row.get("case_name"),
+                mention_ids=mention_ids,
+                close_comment=close_comment,
+            )
+
+            try:
+                resp = app.client.chat_postMessage(
+                    channel=channel_id,
+                    text=message,
+                    thread_ts=thread_ts,
+                )
+            except Exception as exc:
+                logger.exception("Slack投稿に失敗しました: group_key=%s error=%s", group_key, exc)
+                skipped_groups.append(
+                    {
+                        "group_key": group_key,
+                        "reason": "Slack投稿に失敗しました",
+                    }
+                )
+                continue
+
+            sent_count += 1
+            results.append(
+                {
+                    "group_key": group_key,
+                    "channel": channel_id,
+                    "thread_ts": thread_ts,
+                    "thread_link": thread_link,
+                    "mention_count": len(mention_ids),
+                    "ts": resp.get("ts"),
+                }
+            )
+
+        return {
+            "status": "ok",
+            "project_id": project_id,
+            "project_number": case_row.get("number"),
+            "project_name": case_row.get("case_name"),
+            "text": close_comment,
+            "bp_group_count": len(grouped_rows),
+            "sent_count": sent_count,
+            "skipped_count": len(skipped_groups),
+            "results": results,
+            "skipped_groups": skipped_groups,
         }, 200
 
     @flask_app.route("/", methods=["GET"])

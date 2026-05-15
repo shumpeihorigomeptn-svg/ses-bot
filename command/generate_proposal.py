@@ -162,6 +162,7 @@ def generate_proposal(
     candidate_profiles: str,
     proposal_link: Optional[str] = None,
     skill_sheet: Optional[UploadFile] = None,
+    proposal_bp_handler: Optional[str] = None,
 ) -> ProposalResponse:
     """
     Slack Bot などから直接呼び出せる提案生成ロジック.
@@ -206,6 +207,8 @@ def generate_proposal(
             base_payload["proposal_link"] = proposal_link
         if bp_id:
             base_payload["bp_id"] = bp_id
+        if proposal_bp_handler:
+            base_payload["proposal_bp_handler"] = proposal_bp_handler
 
         inserted = _insert_proposal_record(base_payload)
         proposal_id = inserted.get("id")
@@ -247,6 +250,8 @@ def generate_proposal(
 
         if bp_id:
             json_response["bp_id"] = bp_id
+        if proposal_bp_handler:
+            json_response["proposal_bp_handler"] = proposal_bp_handler
 
         proposal_messages = make_proposal_generation_messages(case_summary, prompt)
         proposal_content = llm_api.request_openai(proposal_messages)

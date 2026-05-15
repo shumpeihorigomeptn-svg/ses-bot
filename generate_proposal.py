@@ -323,12 +323,18 @@ def generate_proposal(
     candidate_profiles: str,
     proposal_link: Optional[str] = None,
     skill_sheet: Optional[UploadFile] = None,
+    proposal_bp_handler: Optional[str] = None,
 ) -> ProposalResponse:
     """
     Slack Bot などから直接呼び出せる提案生成ロジック.
     """
 
-    logger.info("Generating proposal for case_num: %s, proposal_link: %s", case_num, proposal_link)
+    logger.info(
+        "Generating proposal for case_num: %s, proposal_link: %s, proposal_bp_handler: %s",
+        case_num,
+        proposal_link,
+        proposal_bp_handler,
+    )
 
     llm_api = LLMAPI()
     prompt = candidate_profiles
@@ -375,8 +381,15 @@ def generate_proposal(
             base_payload["bp_link"] = proposal_link
         if bp_id:
             base_payload["bp_id"] = bp_id
+        if proposal_bp_handler:
+            base_payload["proposal_bp_handler"] = proposal_bp_handler
         if skill_sheet_object_name:
             base_payload["skill_sheet_object_name"] = skill_sheet_object_name
+        logger.info(
+            "Proposal 初回登録 payload: keys=%s proposal_bp_handler=%s",
+            sorted(base_payload.keys()),
+            base_payload.get("proposal_bp_handler"),
+        )
 
         inserted = _insert_proposal_record(base_payload)
         proposal_id = inserted.get("id")
@@ -418,6 +431,8 @@ def generate_proposal(
 
         if bp_id:
             json_response["bp_id"] = bp_id
+        if proposal_bp_handler:
+            json_response["proposal_bp_handler"] = proposal_bp_handler
 
         proposal_messages = make_proposal_generation_messages(case_summary, prompt)
         proposal_content = llm_api.request_openai(proposal_messages)
@@ -425,8 +440,19 @@ def generate_proposal(
 
         if skill_sheet_object_name:
             json_response["skill_sheet_object_name"] = skill_sheet_object_name
+        logger.info(
+            "Proposal 更新 payload: proposal_id=%s proposal_bp_handler=%s keys=%s",
+            proposal_id,
+            json_response.get("proposal_bp_handler"),
+            sorted(json_response.keys()),
+        )
 
         inserted = _update_proposal_record(proposal_id, json_response)
+        logger.info(
+            "Proposal 更新完了: proposal_id=%s saved_proposal_bp_handler=%s",
+            inserted.get("id"),
+            inserted.get("proposal_bp_handler"),
+        )
     except Exception as exc:
         logger.error("Error during proposal generation: %s", exc)
         return ProposalResponse(status="error", proposal_id="")
