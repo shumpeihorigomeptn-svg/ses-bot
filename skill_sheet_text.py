@@ -38,9 +38,9 @@ def _detect_format(filename: str, data: bytes) -> Optional[str]:
                 names = set(zf.namelist())
         except zipfile.BadZipFile:
             return None
-        if any(n.startswith("word/") for n in names):
+        if "word/document.xml" in names:
             return "docx"
-        if any(n.startswith("xl/") for n in names):
+        if "xl/workbook.xml" in names:
             return "xlsx"
         return None
     ext = os.path.splitext(filename or "")[1].lower()
@@ -76,11 +76,14 @@ def _extract_xlsx(data: bytes) -> str:
     parts = []
     try:
         for sheet in workbook.worksheets:
-            parts.append(f"[シート: {sheet.title}]")
+            rows = []
             for row in sheet.iter_rows(values_only=True):
                 cells = [str(v).strip() for v in row if v is not None and str(v).strip()]
                 if cells:
-                    parts.append("\t".join(cells))
+                    rows.append("\t".join(cells))
+            if rows:
+                parts.append(f"[シート: {sheet.title}]")
+                parts.extend(rows)
     finally:
         workbook.close()
     return "\n".join(parts)
@@ -130,10 +133,16 @@ def extract_skill_sheet_text_safe(skill_sheet) -> Tuple[str, Optional[str]]:
 
     try:
         if kind == "pdf":
-            return _extract_pdf(data), None
-        if kind == "docx":
-            return _extract_docx(data), None
-        return _extract_xlsx(data), None
+            text = _extract_pdf(data)
+        elif kind == "docx":
+            text = _extract_docx(data)
+        else:
+            text = _extract_xlsx(data)
     except Exception as exc:
         logger.warning("スキルシート(%s)の解析に失敗しました: %s", kind, exc)
         return "", _build_warning(filename, "ファイルの解析に失敗しました")
+
+    if not text.strip():
+        logger.warning("スキルシート(%s)から本文を抽出できませんでした: filename=%s", kind, filename)
+        return "", _build_warning(filename, "本文を抽出できませんでした。画像のみのPDF等は読み取れません")
+    return text, None
