@@ -12,7 +12,7 @@ import psycopg2
 from dotenv import load_dotenv
 from psycopg2 import sql
 from psycopg2.extras import Json, RealDictCursor
-from pypdf import PdfReader
+from skill_sheet_text import extract_skill_sheet_text_safe
 
 try:
     from fastapi import UploadFile
@@ -244,24 +244,6 @@ def _get_proposal_count_by_case(case_id: str) -> int:
     return 0
 
 
-def _extract_skill_sheet_text(skill_sheet: Optional[UploadFile]) -> str:
-    if not skill_sheet:
-        return ""
-    file_obj = getattr(skill_sheet, "file", None) or skill_sheet
-    if not hasattr(file_obj, "read"):
-        raise ValueError("skill_sheet はファイルオブジェクトではありません")
-    current_pos = None
-    if hasattr(file_obj, "tell") and hasattr(file_obj, "seek"):
-        current_pos = file_obj.tell()
-        file_obj.seek(0)
-    try:
-        reader = PdfReader(file_obj)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    finally:
-        if current_pos is not None:
-            file_obj.seek(current_pos)
-
-
 def _sanitize_filename(filename: str) -> str:
     base = os.path.basename(filename or "").strip()
     if not base:
@@ -347,7 +329,7 @@ def generate_proposal(
             logger.error("Failed to upload skill sheet to GCS: %s", exc)
             raise
 
-    skill_text = _extract_skill_sheet_text(skill_sheet)
+    skill_text, skill_sheet_warning = extract_skill_sheet_text_safe(skill_sheet)
     if skill_text:
         prompt += "\n\nスキルシートの内容:\n" + skill_text
 
@@ -455,6 +437,6 @@ def generate_proposal(
         )
     except Exception as exc:
         logger.error("Error during proposal generation: %s", exc)
-        return ProposalResponse(status="error", proposal_id="")
+        return ProposalResponse(status="error", proposal_id="", warning=skill_sheet_warning)
 
-    return ProposalResponse(status="success", proposal_id=inserted.get("id", ""))
+    return ProposalResponse(status="success", proposal_id=inserted.get("id", ""), warning=skill_sheet_warning)

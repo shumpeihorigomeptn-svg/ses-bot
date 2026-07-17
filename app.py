@@ -854,7 +854,13 @@ def build_app() -> App:
                 proposal_id = getattr(api_resp, "proposal_id", None) or getattr(api_resp, "get", lambda k: None)(
                     "proposal_id"
                 )
-                message = None
+                warning = getattr(api_resp, "warning", None)
+                if warning and status != "error":
+                    say(f"⚠️ {warning}", thread_ts=thread_ts)
+                if status == "error":
+                    message = "提案の登録に失敗しました。時間をおいて再度お試しください。"
+                else:
+                    message = None
             except Exception as e:
                 logger.exception("generate_proposal の呼び出しに失敗しました")
                 message = f"generate_proposal の呼び出しに失敗しました: {e}"

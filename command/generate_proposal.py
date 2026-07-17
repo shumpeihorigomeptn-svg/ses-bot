@@ -6,7 +6,6 @@ import os
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
-from pypdf import PdfReader
 from postgrest import APIError as PostgrestAPIError
 from supabase import Client, create_client
 
@@ -22,6 +21,7 @@ from command.llm_wrapper.prompt import (
     make_proposal_messages,
 )
 from schema.api_schema import ProposalResponse
+from skill_sheet_text import extract_skill_sheet_text_safe
 
 load_dotenv()
 
@@ -138,24 +138,6 @@ def _get_proposal_count_by_case(case_id: str) -> int:
     return len(result.data or [])
 
 
-def _extract_skill_sheet_text(skill_sheet: Optional[UploadFile]) -> str:
-    if not skill_sheet:
-        return ""
-    file_obj = getattr(skill_sheet, "file", None) or skill_sheet
-    if not hasattr(file_obj, "read"):
-        raise ValueError("skill_sheet はファイルオブジェクトではありません")
-    current_pos = None
-    if hasattr(file_obj, "tell") and hasattr(file_obj, "seek"):
-        current_pos = file_obj.tell()
-        file_obj.seek(0)
-    try:
-        reader = PdfReader(file_obj)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    finally:
-        if current_pos is not None:
-            file_obj.seek(current_pos)
-
-
 def generate_proposal(
     *,
     case_num: int,
@@ -173,7 +155,7 @@ def generate_proposal(
     llm_api = LLMAPI()
     prompt = candidate_profiles
 
-    skill_text = _extract_skill_sheet_text(skill_sheet)
+    skill_text, skill_sheet_warning = extract_skill_sheet_text_safe(skill_sheet)
     if skill_text:
         prompt += "\n\nスキルシートの内容:\n" + skill_text
 
@@ -260,6 +242,6 @@ def generate_proposal(
         inserted = _update_proposal_record(proposal_id, json_response)
     except Exception as exc:
         logger.error("Error during proposal generation: %s", exc)
-        return ProposalResponse(status="error", proposal_id="")
+        return ProposalResponse(status="error", proposal_id="", warning=skill_sheet_warning)
 
-    return ProposalResponse(status="success", proposal_id=inserted.get("id", ""))
+    return ProposalResponse(status="success", proposal_id=inserted.get("id", ""), warning=skill_sheet_warning)
