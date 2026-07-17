@@ -38,3 +38,4 @@ class ProposalRequest(BaseModel):
 class ProposalResponse(BaseModel):
     status: str = Field(..., description="処理ステータス")
     proposal_id: str = Field(..., description="生成された提案書のID")
+    warning: Optional[str] = Field(None, description="登録は続行したが利用者へ伝える警告（スキルシート読込失敗など）")

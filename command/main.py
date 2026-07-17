@@ -1,7 +1,7 @@
 import json
 import logging
 
-from pypdf import PdfReader
+from skill_sheet_text import extract_skill_sheet_text_safe
 
 from command.llm_wrapper.llm_wrapper import LLMAPI
 from command.llm_wrapper.prompt import (
@@ -124,42 +124,14 @@ def generate_proposal_supabase(request: ProposalRequest) -> ProposalResponse:
     
     prompt = request.candidate_profiles
     if request.skill_sheet:
-        skill_sheet_file = request.skill_sheet.file
-        file_size = None
-        header_preview = b""
-        try:
-            skill_sheet_file.seek(0, 2)
-            file_size = skill_sheet_file.tell()
-        except Exception as exc:
-            logger.warning("Skill sheetのサイズ取得に失敗しました: %s", exc)
-        finally:
-            try:
-                skill_sheet_file.seek(0)
-            except Exception:
-                pass
-        try:
-            header_preview = skill_sheet_file.read(64) or b""
-        except Exception as exc:
-            logger.warning("Skill sheetの先頭取得に失敗しました: %s", exc)
-        finally:
-            try:
-                skill_sheet_file.seek(0)
-            except Exception:
-                pass
         logger.info(
-            "Skill sheet受領: filename=%s content_type=%s size=%s header(hex)=%s",
+            "Skill sheet受領: filename=%s content_type=%s",
             getattr(request.skill_sheet, "filename", "unknown"),
             getattr(request.skill_sheet, "content_type", "unknown"),
-            file_size if file_size is not None else "unknown",
-            header_preview[:32].hex(),
         )
-        if header_preview and not header_preview.startswith(b"%PDF"):
-            logger.warning("Skill sheetのヘッダーがPDFではない可能性があります")
-        pdf_reader = PdfReader(skill_sheet_file)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        prompt += "\n\nスキルシートの内容:\n" + text
+    skill_text, skill_sheet_warning = extract_skill_sheet_text_safe(request.skill_sheet)
+    if skill_text:
+        prompt += "\n\nスキルシートの内容:\n" + skill_text
     messages = make_proposal_messages(prompt)
     try:
         response = llm_api.request_openai(messages)
@@ -225,6 +197,6 @@ def generate_proposal_supabase(request: ProposalRequest) -> ProposalResponse:
     
     except Exception as e:
         logger.error(f"Error during LLM API request: {e}")
-        return ProposalResponse(status="error", proposal_id="")
+        return ProposalResponse(status="error", proposal_id="", warning=skill_sheet_warning)
 
-    return ProposalResponse(status="success", proposal_id=response.get("id", ""))
+    return ProposalResponse(status="success", proposal_id=response.get("id", ""), warning=skill_sheet_warning)

@@ -854,6 +854,9 @@ def build_app() -> App:
                 proposal_id = getattr(api_resp, "proposal_id", None) or getattr(api_resp, "get", lambda k: None)(
                     "proposal_id"
                 )
+                warning = getattr(api_resp, "warning", None)
+                if warning:
+                    say(f"⚠️ {warning}", thread_ts=thread_ts)
                 message = None
             except Exception as e:
                 logger.exception("generate_proposal の呼び出しに失敗しました")
