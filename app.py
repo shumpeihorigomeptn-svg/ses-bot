@@ -626,12 +626,12 @@ def _build_proposal_update_parent_text(
             case_context = f"{number_label}の案件"
         return (
             f"{case_context}でご提案いただいた、提案者さんに面談依頼をいただきました！\n"
-            "こちらのスレッドで日程調整など進めさせていください。"
+            "こちらのスレッドで日程調整など進めさせてください。"
         )
 
     return (
         f"{case_label}でご提案いただいた{candidate_label}に面談依頼をいただきました！\n"
-        "こちらのスレッドで日程調整など進めさせていください。"
+        "こちらのスレッドで日程調整など進めさせてください。"
     )
 
 
