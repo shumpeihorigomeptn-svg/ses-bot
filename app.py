@@ -786,6 +786,26 @@ def _slack_error_reason(exc: Exception) -> str:
     return str(exc)
 
 
+def _case_announcement_result(
+    *,
+    bp_id: Any,
+    status: str,
+    channel: str | None = None,
+    ts: str | None = None,
+    permalink: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """案件案内のBPごと送信結果1件分を組み立てる。"""
+    return {
+        "bp_id": bp_id,
+        "status": status,
+        "channel": channel,
+        "ts": ts,
+        "permalink": permalink,
+        "reason": reason,
+    }
+
+
 def _process_case_announcement(
     client: Any,
     payload: dict[str, Any],
@@ -819,19 +839,20 @@ def _process_case_announcement(
 
     results: list[dict[str, Any]] = []
     for target in targets:
-        target = target if isinstance(target, dict) else {}
+        if not isinstance(target, dict):
+            results.append(
+                _case_announcement_result(
+                    bp_id=None, status="failed", reason="invalid_target"
+                )
+            )
+            continue
         bp_id = target.get("bp_id")
         channel_id = _normalize_optional_text(target.get("slack_channel_id"))
         if not channel_id:
             results.append(
-                {
-                    "bp_id": bp_id,
-                    "status": "skipped",
-                    "channel": None,
-                    "ts": None,
-                    "permalink": None,
-                    "reason": "slack_channel_id 未設定",
-                }
+                _case_announcement_result(
+                    bp_id=bp_id, status="skipped", reason="slack_channel_id 未設定"
+                )
             )
             continue
 
@@ -850,14 +871,12 @@ def _process_case_announcement(
                 exc,
             )
             results.append(
-                {
-                    "bp_id": bp_id,
-                    "status": "failed",
-                    "channel": channel_id,
-                    "ts": None,
-                    "permalink": None,
-                    "reason": _slack_error_reason(exc),
-                }
+                _case_announcement_result(
+                    bp_id=bp_id,
+                    status="failed",
+                    channel=channel_id,
+                    reason=_slack_error_reason(exc),
+                )
             )
             continue
 
@@ -869,14 +888,12 @@ def _process_case_announcement(
                 channel_id,
             )
             results.append(
-                {
-                    "bp_id": bp_id,
-                    "status": "failed",
-                    "channel": channel_id,
-                    "ts": None,
-                    "permalink": None,
-                    "reason": "missing_parent_ts",
-                }
+                _case_announcement_result(
+                    bp_id=bp_id,
+                    status="failed",
+                    channel=channel_id,
+                    reason="missing_parent_ts",
+                )
             )
             continue
 
@@ -916,14 +933,14 @@ def _process_case_announcement(
             reason = reason or "permalink_fetch_failed"
 
         results.append(
-            {
-                "bp_id": bp_id,
-                "status": target_status,
-                "channel": channel_id,
-                "ts": parent_ts,
-                "permalink": permalink,
-                "reason": reason,
-            }
+            _case_announcement_result(
+                bp_id=bp_id,
+                status=target_status,
+                channel=channel_id,
+                ts=parent_ts,
+                permalink=permalink,
+                reason=reason,
+            )
         )
 
     failed_count = sum(1 for r in results if r["status"] == "failed")

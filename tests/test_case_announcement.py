@@ -270,6 +270,20 @@ class TestValidation:
         assert "error" in body
         client.chat_postMessage.assert_not_called()
 
+    def test_non_dict_target_is_failed(self):
+        client = _make_client()
+        payload = _payload(
+            targets=[
+                "C001",
+                {"bp_id": "bp-1", "bp_name": "A社", "slack_channel_id": "C001"},
+            ]
+        )
+        body, status = app_module._process_case_announcement(client, payload)
+        assert status == 200
+        assert body["results"][0]["status"] == "failed"
+        assert body["results"][0]["reason"] == "invalid_target"
+        assert body["results"][1]["status"] == "sent"
+
     @pytest.mark.parametrize("payload", [["a"], "text", 123])
     def test_non_dict_payload_returns_400(self, payload):
         client = _make_client()
