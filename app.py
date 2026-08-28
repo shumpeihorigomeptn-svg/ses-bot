@@ -794,8 +794,12 @@ def _process_case_announcement(
 
     親投稿（メンション＋main_text＋シートリンク）→スレッド返信（thread_text）の
     2段構成で送信する。client_budget / client_name はBP開示NGのため一切参照しない。
+    親投稿のみ成功しスレッド返信に失敗した場合は status='partial'。
     全targetがfailedの場合のみ502。
     """
+    if not isinstance(payload, dict):
+        return {"error": "JSONオブジェクトが必要です"}, 400
+
     case_id = _normalize_optional_text(payload.get("case_id"))
     main_text = _normalize_optional_text(payload.get("main_text"))
     thread_text = _normalize_optional_text(payload.get("thread_text"))
@@ -858,6 +862,25 @@ def _process_case_announcement(
             continue
 
         parent_ts = post_resp.get("ts")
+        if not parent_ts:
+            logger.warning(
+                "案件案内の親投稿tsが取得できませんでした: bp_id=%s channel=%s",
+                bp_id,
+                channel_id,
+            )
+            results.append(
+                {
+                    "bp_id": bp_id,
+                    "status": "failed",
+                    "channel": channel_id,
+                    "ts": None,
+                    "permalink": None,
+                    "reason": "missing_parent_ts",
+                }
+            )
+            continue
+
+        target_status = "sent"
         reason: str | None = None
 
         if thread_text:
@@ -874,6 +897,7 @@ def _process_case_announcement(
                     channel_id,
                     exc,
                 )
+                target_status = "partial"
                 reason = "thread_post_failed"
 
         permalink = None
@@ -894,7 +918,7 @@ def _process_case_announcement(
         results.append(
             {
                 "bp_id": bp_id,
-                "status": "sent",
+                "status": target_status,
                 "channel": channel_id,
                 "ts": parent_ts,
                 "permalink": permalink,
@@ -1413,9 +1437,9 @@ def main() -> None:
 
     @flask_app.route("/case-announcement", methods=["POST"])
     def case_announcement():
-        payload = request.get_json(silent=True) or {}
-        if not payload:
-            return {"error": "JSONボディが必要です"}, 400
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or not payload:
+            return {"error": "JSONオブジェクトのボディが必要です"}, 400
         body, status_code = _process_case_announcement(app.client, payload)
         return body, status_code
 

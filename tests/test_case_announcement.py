@@ -211,7 +211,7 @@ class TestProcessCaseAnnouncement:
         assert result["permalink"] is None
         assert result["reason"] == "permalink_fetch_failed"
 
-    def test_thread_post_failure_keeps_sent(self):
+    def test_thread_post_failure_is_partial(self):
         error = app_module.SlackApiError(
             message="err", response={"ok": False, "error": "rate_limited"}
         )
@@ -221,8 +221,21 @@ class TestProcessCaseAnnouncement:
         body, status = app_module._process_case_announcement(client, _payload())
         assert status == 200
         result = body["results"][0]
-        assert result["status"] == "sent"
+        assert result["status"] == "partial"
+        assert result["ts"] == "1700.001"
         assert result["reason"] == "thread_post_failed"
+
+    def test_missing_parent_ts_is_failed(self):
+        client = _make_client()
+        client.chat_postMessage.return_value = {"ok": True}  # tsなし
+        body, status = app_module._process_case_announcement(client, _payload())
+        assert status == 502
+        result = body["results"][0]
+        assert result["status"] == "failed"
+        assert result["reason"] == "missing_parent_ts"
+        # スレッド返信・permalink取得に進まない
+        assert client.chat_postMessage.call_count == 1
+        client.chat_getPermalink.assert_not_called()
 
     def test_client_confidential_fields_never_posted(self):
         """client_budget / client_name がペイロードに混入しても投稿本文に現れない。"""
@@ -253,6 +266,14 @@ class TestValidation:
         body, status = app_module._process_case_announcement(
             client, _payload(**overrides)
         )
+        assert status == 400
+        assert "error" in body
+        client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.parametrize("payload", [["a"], "text", 123])
+    def test_non_dict_payload_returns_400(self, payload):
+        client = _make_client()
+        body, status = app_module._process_case_announcement(client, payload)
         assert status == 400
         assert "error" in body
         client.chat_postMessage.assert_not_called()
