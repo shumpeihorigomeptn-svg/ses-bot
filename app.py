@@ -16,6 +16,7 @@ from flask import Flask, request
 from psycopg2.extras import RealDictCursor
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
+from slack_sdk.errors import SlackApiError
 from generate_proposal import (
     generate_proposal as generate_proposal_internal,
     get_case_user_name_by_number,
@@ -742,6 +743,211 @@ def _build_project_close_message(
     return "\n".join(lines)
 
 
+def _resolve_case_announcement_mention_id(
+    *,
+    user_name: Any,
+    user_slack_id: Any,
+) -> str | None:
+    """案件案内の担当者メンション先Slack IDを解決する（明示ID優先、次にUSER_LIST）。"""
+    slack_id = _normalize_optional_text(user_slack_id)
+    if slack_id:
+        return slack_id
+    name = _normalize_optional_text(user_name)
+    return USER_LIST.get(name)
+
+
+def _build_case_announcement_parent_text(
+    *,
+    main_text: str,
+    mention_id: str | None,
+    case_sheet_url: Any = None,
+) -> str:
+    """案件案内の親投稿本文を組み立てる（担当メンション＋本文＋BPごとの案件紹介シートリンク）。"""
+    lines: list[str] = []
+    if mention_id:
+        lines.append(f"担当: <@{mention_id}>")
+    lines.append(main_text.strip())
+    sheet_url = _normalize_optional_text(case_sheet_url)
+    if sheet_url:
+        lines.append(f"📄 案件紹介シート: <{sheet_url}|貴社向け案件一覧>")
+    return "\n".join(lines)
+
+
+def _slack_error_reason(exc: Exception) -> str:
+    """Slack API例外からエラーコード文字列を取り出す（取れなければstr(exc)）。"""
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            error_code = response.get("error")
+        except (AttributeError, TypeError):
+            error_code = None
+        if error_code:
+            return str(error_code)
+    return str(exc)
+
+
+def _case_announcement_result(
+    *,
+    bp_id: Any,
+    status: str,
+    channel: str | None = None,
+    ts: str | None = None,
+    permalink: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """案件案内のBPごと送信結果1件分を組み立てる。"""
+    return {
+        "bp_id": bp_id,
+        "status": status,
+        "channel": channel,
+        "ts": ts,
+        "permalink": permalink,
+        "reason": reason,
+    }
+
+
+def _process_case_announcement(
+    client: Any,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """案件案内を各BPチャンネルへ送信し、BPごとの結果と HTTPステータスを返す。
+
+    親投稿（メンション＋main_text＋シートリンク）→スレッド返信（thread_text）の
+    2段構成で送信する。client_budget / client_name はBP開示NGのため一切参照しない。
+    親投稿のみ成功しスレッド返信に失敗した場合は status='partial'。
+    全targetがfailedの場合のみ502。
+    """
+    if not isinstance(payload, dict):
+        return {"error": "JSONオブジェクトが必要です"}, 400
+
+    case_id = _normalize_optional_text(payload.get("case_id"))
+    main_text = _normalize_optional_text(payload.get("main_text"))
+    thread_text = _normalize_optional_text(payload.get("thread_text"))
+    targets = payload.get("targets")
+
+    if not case_id:
+        return {"error": "case_id は必須です"}, 400
+    if not main_text:
+        return {"error": "main_text は必須です"}, 400
+    if not isinstance(targets, list) or not targets:
+        return {"error": "targets は1件以上必要です"}, 400
+
+    mention_id = _resolve_case_announcement_mention_id(
+        user_name=payload.get("user_name"),
+        user_slack_id=payload.get("user_slack_id"),
+    )
+
+    results: list[dict[str, Any]] = []
+    for target in targets:
+        if not isinstance(target, dict):
+            results.append(
+                _case_announcement_result(
+                    bp_id=None, status="failed", reason="invalid_target"
+                )
+            )
+            continue
+        bp_id = target.get("bp_id")
+        channel_id = _normalize_optional_text(target.get("slack_channel_id"))
+        if not channel_id:
+            results.append(
+                _case_announcement_result(
+                    bp_id=bp_id, status="skipped", reason="slack_channel_id 未設定"
+                )
+            )
+            continue
+
+        parent_text = _build_case_announcement_parent_text(
+            main_text=main_text,
+            mention_id=mention_id,
+            case_sheet_url=target.get("case_sheet_url"),
+        )
+        try:
+            post_resp = client.chat_postMessage(channel=channel_id, text=parent_text)
+        except Exception as exc:
+            logger.warning(
+                "案件案内の親投稿に失敗しました: bp_id=%s channel=%s error=%s",
+                bp_id,
+                channel_id,
+                exc,
+            )
+            results.append(
+                _case_announcement_result(
+                    bp_id=bp_id,
+                    status="failed",
+                    channel=channel_id,
+                    reason=_slack_error_reason(exc),
+                )
+            )
+            continue
+
+        parent_ts = post_resp.get("ts")
+        if not parent_ts:
+            logger.warning(
+                "案件案内の親投稿tsが取得できませんでした: bp_id=%s channel=%s",
+                bp_id,
+                channel_id,
+            )
+            results.append(
+                _case_announcement_result(
+                    bp_id=bp_id,
+                    status="failed",
+                    channel=channel_id,
+                    reason="missing_parent_ts",
+                )
+            )
+            continue
+
+        target_status = "sent"
+        reason: str | None = None
+
+        if thread_text:
+            try:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    text=thread_text,
+                    thread_ts=parent_ts,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "案件案内のスレッド返信に失敗しました: bp_id=%s channel=%s error=%s",
+                    bp_id,
+                    channel_id,
+                    exc,
+                )
+                target_status = "partial"
+                reason = "thread_post_failed"
+
+        permalink = None
+        try:
+            permalink_resp = client.chat_getPermalink(
+                channel=channel_id, message_ts=parent_ts
+            )
+            permalink = permalink_resp.get("permalink")
+        except Exception as exc:
+            logger.warning(
+                "案件案内のpermalink取得に失敗しました: bp_id=%s channel=%s error=%s",
+                bp_id,
+                channel_id,
+                exc,
+            )
+            reason = reason or "permalink_fetch_failed"
+
+        results.append(
+            _case_announcement_result(
+                bp_id=bp_id,
+                status=target_status,
+                channel=channel_id,
+                ts=parent_ts,
+                permalink=permalink,
+                reason=reason,
+            )
+        )
+
+    failed_count = sum(1 for r in results if r["status"] == "failed")
+    status_code = 502 if failed_count and failed_count == len(results) else 200
+    return {"status": "ok", "case_id": case_id, "results": results}, status_code
+
+
 def build_app() -> App:
     load_dotenv()  # .envから環境変数を読み込む
     bot_token = os.environ.get("SLACK_BOT_TOKEN")
@@ -1245,6 +1451,14 @@ def main() -> None:
             "results": results,
             "skipped_groups": skipped_groups,
         }, 200
+
+    @flask_app.route("/case-announcement", methods=["POST"])
+    def case_announcement():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or not payload:
+            return {"error": "JSONオブジェクトのボディが必要です"}, 400
+        body, status_code = _process_case_announcement(app.client, payload)
+        return body, status_code
 
     @flask_app.route("/", methods=["GET"])
     def healthcheck():
