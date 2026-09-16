@@ -291,3 +291,43 @@ class TestValidation:
         assert status == 400
         assert "error" in body
         client.chat_postMessage.assert_not_called()
+
+
+class TestFixedTemplate:
+    def test_preview_matches_post_for_each_bp(self):
+        announcement = {
+            "title": "No.123 製造業PM", "introduction": "紹介文", "pitch": "→ PM募集\n（80〜100% ／ 東京 ／ 10月）",
+            "closing": "ご提案はワークフローからお願いします。\nご提案、お待ちしています！",
+        }
+        payload = _payload(announcement=announcement, main_text="", targets=[
+            {"bp_id": "bp-1", "slack_channel_id": "C1", "case_sheet_url": "https://example.com/a"},
+            {"bp_id": "bp-2", "slack_channel_id": "C2", "case_sheet_url": None},
+        ])
+        preview, status = app_module._preview_case_announcement(payload)
+        assert status == 200
+        client = _make_client()
+        _, status = app_module._process_case_announcement(client, payload)
+        assert status == 200
+        parents = [call.kwargs["text"] for call in client.chat_postMessage.call_args_list if "thread_ts" not in call.kwargs]
+        assert parents == [item["text"] for item in preview["previews"]]
+        assert parents[0].splitlines()[:3] == ["📢【新規案件のご案内】", "No.123 製造業PM", ""]
+        assert len(parents[0].split("\n\n")) == 5
+        assert parents[0].count("ご不明点") == 1
+        assert "案件紹介シート" not in parents[1]
+        assert len(parents[1].split("\n\n")) == 5
+        assert parents[0].endswith("ご不明点は <@U05CP9LLACX> までお願いします。")
+
+    @pytest.mark.parametrize("announcement", [{}, [], {"title":"見出し", "introduction":" ", "pitch":"募集", "closing":""}])
+    def test_invalid_structured_body_never_posts(self, announcement):
+        client = _make_client()
+        payload = _payload(announcement=announcement)
+        assert app_module._preview_case_announcement(payload)[1] == 400
+        assert app_module._process_case_announcement(client, payload)[1] == 400
+        client.chat_postMessage.assert_not_called()
+
+    def test_unresolved_contact_and_empty_closing_do_not_make_blank_final_block(self):
+        payload = _payload(user_name="未登録", announcement={"title":"No.1 案件", "introduction":"紹介", "pitch":"募集", "closing":""})
+        body, status = app_module._preview_case_announcement(payload)
+        assert status == 200
+        assert "ご不明点" not in body["previews"][0]["text"]
+        assert not body["previews"][0]["text"].endswith("\n")
