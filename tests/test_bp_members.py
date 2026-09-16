@@ -29,7 +29,9 @@ def client():
 
 def test_pagination_and_own_bot_deleted_unknown_are_disabled():
     c = client()
-    members = channel_members(c, "C123")
+    first = channel_members(c, "C123")
+    second = channel_members(c, "C123", cursor=first["next_cursor"])
+    members = first["members"] + [m for m in second["members"] if m["id"] not in {v["id"] for v in first["members"]}]
     assert [m["id"] for m in members if m["selectable"]] == ["U1"]
     assert len(members) == 7
     assert members[0]["display_name"] == "名前U1"
@@ -87,3 +89,33 @@ def test_preview_equals_send_and_empty_handlers_are_sent(ids):
 def test_bad_id_cannot_inject_mentions():
     with pytest.raises(ValueError):
         build_parent_text(CONTENT, None, None, bp_handler_ids=["U1> <!here"])
+
+
+def test_save_validation_resolves_only_selected_users_across_pages():
+    c = client()
+    result = channel_members(c, 'C123', selected_ids=['U1', 'U5'])
+    assert [m['id'] for m in result['members']] == ['U1', 'U5']
+    assert c.users_info.call_count == 2
+    assert c.conversations_members.call_count == 2
+
+
+def test_duplicate_cursor_is_rejected():
+    c = client()
+    c.conversations_members.side_effect = None
+    c.conversations_members.return_value = {'members': [], 'response_metadata': {'next_cursor': 'same'}}
+    with pytest.raises(RuntimeError):
+        channel_members(c, 'C123', selected_ids=['U1'])
+
+
+def test_name_lookup_has_input_limit_and_stops_on_slack_outage():
+    c = client()
+    server = Flask(__name__)
+    server.register_blueprint(create_bp_members_blueprint(c))
+    http = server.test_client()
+    assert http.post('/bp-users', json={'user_ids': ['U' + str(i) for i in range(101)]}).status_code == 400
+    c.users_info.side_effect = RuntimeError('rate_limited')
+    result = http.post('/bp-users', json={'user_ids': ['U1', 'U2']})
+    assert result.status_code == 200
+    assert len(result.json['users']) == 2
+    assert all(not u['resolved'] for u in result.json['users'])
+    assert c.users_info.call_count == 1
