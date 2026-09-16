@@ -763,6 +763,7 @@ def _build_case_announcement_parent_text(
     mention_id: str | None,
     case_sheet_url: Any = None,
     announcement: dict[str, str] | None = None,
+    has_thread: bool = True,
 ) -> str:
     """プレビューと送信に共通の親投稿本文を返す。
 
@@ -771,11 +772,12 @@ def _build_case_announcement_parent_text(
         mention_id: Speee担当のSlack ID。
         case_sheet_url: BP別シートURL。
         announcement: 固定見出しと編集済み3ブロック。Noneは旧形式。
+        has_thread: スレッド返信を投稿するかどうか。
     Returns:
         Slackへ送る本文。
     """
     if announcement is not None:
-        return build_parent_text(announcement, mention_id, case_sheet_url)
+        return build_parent_text(announcement, mention_id, case_sheet_url, has_thread=has_thread)
     lines: list[str] = []
     if mention_id:
         lines.append(f"担当: <@{mention_id}>")
@@ -809,6 +811,7 @@ def _preview_case_announcement(payload: Any) -> tuple[dict[str, Any], int]:
                 main_text="", mention_id=mention_id,
                 case_sheet_url=target.get("case_sheet_url"),
                 announcement=payload["announcement"],
+                has_thread=payload.get("has_thread", True),
             ),
             "mention_id": mention_id,
             "user_name": payload.get("user_name") or "",
@@ -915,6 +918,7 @@ def _process_case_announcement(
             mention_id=mention_id,
             case_sheet_url=target.get("case_sheet_url"),
             announcement=announcement,
+            has_thread=bool(thread_text),
         )
         try:
             post_resp = client.chat_postMessage(channel=channel_id, text=parent_text)
