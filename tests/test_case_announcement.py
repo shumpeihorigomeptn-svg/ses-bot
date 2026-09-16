@@ -331,3 +331,21 @@ class TestFixedTemplate:
         assert status == 200
         assert "ご不明点" not in body["previews"][0]["text"]
         assert not body["previews"][0]["text"].endswith("\n")
+
+
+@pytest.mark.parametrize("url", ["javascript:alert(1)", "https://example.com/|evil", "https://example.com/\nx", "http://[", 123, None])
+def test_template_omits_invalid_sheet_urls(url):
+    from case_announcement_layout import build_parent_text
+    content = {"title":"No.1 案件", "introduction":"紹介", "pitch":"募集", "closing":"締め"}
+    assert "案件紹介シート" not in build_parent_text(content, "U1", url)
+
+
+def test_template_preserves_plain_special_characters_and_block_boundaries():
+    from case_announcement_layout import build_parent_text
+    content = {"title":"No.1 A&B", "introduction":"比較 <React>\n\n第2行", "pitch":"→ 募集\n \n（東京）", "closing":"締め\n\n<!here>"}
+    text = build_parent_text(content, "U1", "https://example.com/?a=1&b=2")
+    assert len(text.split("\n\n")) == 5
+    assert "A&amp;B" in text and "&lt;React&gt;\n第2行" in text
+    assert "<!here>" not in text and "&lt;!here&gt;" in text
+    assert "<@U1>" in text
+    assert "<https://example.com/?a=1&amp;b=2|貴社向け案件一覧>" in text

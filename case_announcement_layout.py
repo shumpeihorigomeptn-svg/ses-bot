@@ -17,11 +17,23 @@ def validate_announcement(value: Any) -> bool:
     )
 
 
+def _plain_block(value: str) -> str:
+    """空行をブロック境界に限定し、Slack制御文字を文字として表示する。
+
+    Args:
+        value: 検証済み編集ブロック。
+    Returns:
+        空行を除去し & < > のみをエスケープした文字列。
+    """
+    text = "\n".join(line.strip() for line in value.splitlines() if line.strip())
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def build_parent_text(announcement: dict[str, str], mention_id: str | None, sheet_url: Any) -> str:
     """5ブロックの間に空行を入れ、見出しラベルの直後を改行する。
 
     Args:
-        announcement: title、introduction、pitch、closing。
+        announcement: 検証済みのtitle、introduction、pitch、closing（空可）。
         mention_id: Speee担当ID。未解決時は問い合わせ行を省略する。
         sheet_url: BPごとのシートURL。未設定・不正時は省略する。
     Returns:
@@ -35,15 +47,16 @@ def build_parent_text(announcement: dict[str, str], mention_id: str | None, shee
     except ValueError:
         safe_url = False
     if safe_url and not any(c in url for c in "<>|\n\r"):
-        links.append(f"📄 案件紹介シート: <{url}|貴社向け案件一覧>")
+        escaped_url = url.replace("&", "&amp;")
+        links.append(f"📄 案件紹介シート: <{escaped_url}|貴社向け案件一覧>")
     links.append("💬 案件詳細は本投稿のスレッドをご覧ください。")
-    closing = [announcement["closing"].strip()]
+    closing = [_plain_block(announcement["closing"])]
     if mention_id:
         closing.append(f"ご不明点は <@{mention_id}> までお願いします。")
     blocks = [
-        "📢【新規案件のご案内】\n" + announcement["title"].strip(),
-        announcement["introduction"].strip(),
-        announcement["pitch"].strip(),
+        "📢【新規案件のご案内】\n" + _plain_block(announcement["title"]),
+        _plain_block(announcement["introduction"]),
+        _plain_block(announcement["pitch"]),
         "\n".join(links),
         "\n".join(line for line in closing if line),
     ]
