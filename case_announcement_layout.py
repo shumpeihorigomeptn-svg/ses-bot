@@ -1,5 +1,6 @@
 """案件案内の固定テンプレート（送信・プレビュー共通）。"""
 from typing import Any
+from bp_members import handler_ids
 from urllib.parse import urlparse
 
 
@@ -29,7 +30,7 @@ def _plain_block(value: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def build_parent_text(announcement: dict[str, str], mention_id: str | None, sheet_url: Any, *, has_thread: bool = True) -> str:
+def build_parent_text(announcement: dict[str, str], mention_id: str | None, sheet_url: Any, *, has_thread: bool = True, bp_handler_ids: list[str] | None = None) -> str:
     """5ブロックの間に空行を入れ、見出しラベルの直後を改行する。
 
     Args:
@@ -37,6 +38,7 @@ def build_parent_text(announcement: dict[str, str], mention_id: str | None, shee
         mention_id: Speee担当ID。未解決時は問い合わせ行を省略する。
         sheet_url: BPごとのシートURL。未設定・不正時は省略する。
         has_thread: スレッド返信がある場合だけ誘導行を表示する。
+        bp_handler_ids: BP側担当者のSlack ID。未設定ならメンションブロックを省略。
     Returns:
         完成したSlack本文。
     """
@@ -57,6 +59,7 @@ def build_parent_text(announcement: dict[str, str], mention_id: str | None, shee
         closing.append(f"ご不明点は <@{mention_id}> までお願いします。")
     blocks = [
         "📢【新規案件のご案内】\n" + _plain_block(announcement["title"]),
+        " ".join(f"<@{uid}>" for uid in handler_ids(bp_handler_ids)),
         _plain_block(announcement["introduction"]),
         _plain_block(announcement["pitch"]),
         "\n".join(links),
