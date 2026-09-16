@@ -3,6 +3,7 @@ import re
 import logging
 import time
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from flask import Blueprint, request
 
 
@@ -58,11 +59,11 @@ def channel_members(client, channel_id, *, cursor="", selected_ids=None):
     if not isinstance(channel_id, str) or not re.fullmatch(r"[CG][A-Z0-9]+", channel_id):
         raise ValueError("SlackチャンネルIDを確認してください")
     selected = handler_ids(selected_ids) if selected_ids is not None else None
+    deadline = time.monotonic() + 20
     identity = client.auth_test()
     if not identity.get("team_id"):
         raise RuntimeError("自社ワークスペースを確認できません")
     ids, seen = [], set()
-    deadline = time.monotonic() + 20
     while True:
         if time.monotonic() > deadline:
             raise RuntimeError("参加者の取得がタイムアウトしました")
@@ -107,7 +108,9 @@ def resolve_users(client, ids):
         except Exception as exc:
             if not unavailable:
                 logging.getLogger(__name__).warning("BP担当者の表示名取得に失敗: %s", type(exc).__name__)
-            unavailable = True
+            # 退会・不可視など単一ユーザーの失敗は他BPへ波及させない。
+            individual_error = isinstance(exc, SlackApiError) and exc.response.get("error") in {"user_not_found", "user_not_visible", "account_inactive"}
+            unavailable = not individual_error
             users.append({"id": uid, "display_name": uid, "resolved": False})
     return users
 

@@ -119,3 +119,16 @@ def test_name_lookup_has_input_limit_and_stops_on_slack_outage():
     assert len(result.json['users']) == 2
     assert all(not u['resolved'] for u in result.json['users'])
     assert c.users_info.call_count == 1
+
+
+def test_one_deleted_user_does_not_hide_other_bp_names():
+    from slack_sdk.errors import SlackApiError
+    c = client()
+    c.users_info.side_effect = [
+        {'user': {'profile': {'display_name': 'A'}}},
+        SlackApiError('gone', {'error': 'user_not_found'}),
+        {'user': {'profile': {'display_name': 'B'}}},
+    ]
+    result = resolve_users(c, ['U1', 'U2', 'U3'])
+    assert [u['display_name'] for u in result] == ['A', 'U2', 'B']
+    assert c.users_info.call_count == 3
