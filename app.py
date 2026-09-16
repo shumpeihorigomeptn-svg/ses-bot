@@ -17,6 +17,7 @@ from psycopg2.extras import RealDictCursor
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from slack_sdk.errors import SlackApiError
+from bp_members import create_bp_members_blueprint, handler_ids
 from case_announcement_layout import build_parent_text, validate_announcement
 from generate_proposal import (
     generate_proposal as generate_proposal_internal,
@@ -764,6 +765,7 @@ def _build_case_announcement_parent_text(
     case_sheet_url: Any = None,
     announcement: dict[str, str] | None = None,
     has_thread: bool = True,
+    bp_handler_ids: list[str] | None = None,
 ) -> str:
     """プレビューと送信に共通の親投稿本文を返す。
 
@@ -773,14 +775,17 @@ def _build_case_announcement_parent_text(
         case_sheet_url: BP別シートURL。
         announcement: 固定見出しと編集済み3ブロック。Noneは旧形式。
         has_thread: スレッド返信を投稿するかどうか。
+        bp_handler_ids: BP担当者ID。
     Returns:
         Slackへ送る本文。
     """
     if announcement is not None:
-        return build_parent_text(announcement, mention_id, case_sheet_url, has_thread=has_thread)
+        return build_parent_text(announcement, mention_id, case_sheet_url, has_thread=has_thread, bp_handler_ids=bp_handler_ids)
     lines: list[str] = []
     if mention_id:
         lines.append(f"担当: <@{mention_id}>")
+    if bp_handler_ids:
+        lines.append(" ".join(f"<@{uid}>" for uid in handler_ids(bp_handler_ids)))
     lines.append(main_text.strip())
     sheet_url = _normalize_optional_text(case_sheet_url)
     if sheet_url:
@@ -801,6 +806,11 @@ def _preview_case_announcement(payload: Any) -> tuple[dict[str, Any], int]:
     targets = payload.get("targets")
     if not isinstance(targets, list) or not targets or any(not isinstance(t, dict) for t in targets):
         return {"error": "targets は1件以上必要です"}, 400
+    try:
+        for target in targets:
+            handler_ids(target.get("handler_slack_ids"))
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
     mention_id = _resolve_case_announcement_mention_id(
         user_name=payload.get("user_name"), user_slack_id=payload.get("user_slack_id")
     )
@@ -812,6 +822,7 @@ def _preview_case_announcement(payload: Any) -> tuple[dict[str, Any], int]:
                 case_sheet_url=target.get("case_sheet_url"),
                 announcement=payload["announcement"],
                 has_thread=payload.get("has_thread", True),
+                bp_handler_ids=target.get("handler_slack_ids"),
             ),
             "mention_id": mention_id,
             "user_name": payload.get("user_name") or "",
@@ -913,12 +924,18 @@ def _process_case_announcement(
             )
             continue
 
+        try:
+            handler_ids(target.get("handler_slack_ids"))
+        except ValueError:
+            results.append(_case_announcement_result(bp_id=bp_id, status="failed", reason="invalid_handler_ids"))
+            continue
         parent_text = _build_case_announcement_parent_text(
             main_text=main_text,
             mention_id=mention_id,
             case_sheet_url=target.get("case_sheet_url"),
             announcement=announcement,
             has_thread=bool(thread_text),
+            bp_handler_ids=target.get("handler_slack_ids"),
         )
         try:
             post_resp = client.chat_postMessage(channel=channel_id, text=parent_text)
@@ -1510,6 +1527,8 @@ def main() -> None:
             "results": results,
             "skipped_groups": skipped_groups,
         }, 200
+
+    flask_app.register_blueprint(create_bp_members_blueprint(app.client))
 
     @flask_app.route("/case-announcement/preview", methods=["POST"])
     def case_announcement_preview():
