@@ -1,5 +1,8 @@
 """BP担当者選択向けのSlack読取専用API。プロフィールは永続化しない。"""
 import re
+import os
+import hmac
+from bp_directory_auth import sign_directory_request
 import logging
 import time
 from slack_sdk import WebClient
@@ -127,6 +130,24 @@ def create_bp_members_blueprint(client):
     # 通常投稿のクライアント設定は変えず、読取APIだけ待機時間を制限する。
     if isinstance(client, WebClient):
         client = WebClient(token=client.token, timeout=5, retry_handlers=[])
+
+    @blueprint.before_request
+    def require_directory_signature():
+        """署名なし・期限切れ・改ざん要求を拒否する。Args: HTTP要求。Returns: 拒否応答またはNone。"""
+        secret = os.getenv("JWT_SECRET_KEY")
+        if not secret:
+            return {"error": "directory authentication unavailable"}, 503
+        timestamp = request.headers.get("X-BP-Directory-Timestamp", "")
+        signature = request.headers.get("X-BP-Directory-Signature", "")
+        if not re.fullmatch(r"[0-9]{10}", timestamp) or not re.fullmatch(r"[0-9a-f]{64}", signature):
+            return {"error": "unauthorized"}, 401
+        if abs(time.time() - int(timestamp)) > 60:
+            return {"error": "unauthorized"}, 401
+        target = request.path + ("?" + request.query_string.decode("ascii", errors="replace") if request.query_string else "")
+        expected = sign_directory_request(secret, timestamp, request.method, target, request.get_data())
+        if not hmac.compare_digest(signature, expected):
+            return {"error": "unauthorized"}, 401
+        return None
 
     @blueprint.get("/bp-members")
     def members():

@@ -1,10 +1,30 @@
 """Slackを呼ばず、参加者分類・ページング・案内送信の契約を検証する。"""
 from unittest.mock import MagicMock
 import pytest
+import time
+from bp_directory_auth import sign_directory_request
 from flask import Flask
 from bp_members import channel_members, resolve_users, create_bp_members_blueprint
 from case_announcement_layout import build_parent_text
 import app as bot
+
+
+@pytest.fixture(autouse=True)
+def directory_key(monkeypatch):
+    monkeypatch.setenv('JWT_SECRET_KEY', 'test-directory-key')
+
+
+def signed_client(server):
+    raw = server.test_client()
+    class Client:
+        def get(self, target):
+            timestamp = str(int(time.time()))
+            return raw.get(target, headers={'X-BP-Directory-Timestamp': timestamp, 'X-BP-Directory-Signature': sign_directory_request('test-directory-key', timestamp, 'GET', target, b'')})
+        def post(self, target, json):
+            body = server.json.dumps(json).encode()
+            timestamp = str(int(time.time()))
+            return raw.post(target, data=body, content_type='application/json', headers={'X-BP-Directory-Timestamp': timestamp, 'X-BP-Directory-Signature': sign_directory_request('test-directory-key', timestamp, 'POST', target, body)})
+    return Client()
 
 
 def client():
@@ -57,7 +77,7 @@ def test_readonly_routes_fail_recover_and_reject_bad_input():
     c = client()
     server = Flask(__name__)
     server.register_blueprint(create_bp_members_blueprint(c))
-    http = server.test_client()
+    http = signed_client(server)
     assert http.get('/bp-members?channel_id=C123').status_code == 200
     assert http.get('/bp-members?channel_id=bad').status_code == 400
     assert http.post('/bp-users', json={"user_ids": ["U1><!here"]}).status_code == 400
@@ -111,7 +131,7 @@ def test_name_lookup_has_input_limit_and_stops_on_slack_outage():
     c = client()
     server = Flask(__name__)
     server.register_blueprint(create_bp_members_blueprint(c))
-    http = server.test_client()
+    http = signed_client(server)
     assert http.post('/bp-users', json={'user_ids': ['U' + str(i) for i in range(101)]}).status_code == 400
     c.users_info.side_effect = RuntimeError('rate_limited')
     result = http.post('/bp-users', json={'user_ids': ['U1', 'U2']})
@@ -132,3 +152,23 @@ def test_one_deleted_user_does_not_hide_other_bp_names():
     result = resolve_users(c, ['U1', 'U2', 'U3'])
     assert [u['display_name'] for u in result] == ['A', 'U2', 'B']
     assert c.users_info.call_count == 3
+
+
+
+def test_directory_requires_fresh_signature_bound_to_query_and_body(monkeypatch):
+    c = client()
+    server = Flask(__name__)
+    server.register_blueprint(create_bp_members_blueprint(c))
+    http = server.test_client()
+    target = '/bp-members?channel_id=C123'
+    assert http.get(target).status_code == 401
+    timestamp = str(int(time.time()))
+    headers = {'X-BP-Directory-Timestamp': timestamp, 'X-BP-Directory-Signature': sign_directory_request('test-directory-key', timestamp, 'GET', target, b'')}
+    assert http.get('/bp-members?channel_id=C456', headers=headers).status_code == 401
+    stale = str(int(time.time()) - 120)
+    assert http.get(target, headers={'X-BP-Directory-Timestamp': stale, 'X-BP-Directory-Signature': sign_directory_request('test-directory-key', stale, 'GET', target, b'')}).status_code == 401
+    assert http.post('/bp-users', json={'user_ids': ['U1']}, headers=headers).status_code == 401
+    c.users_info.assert_not_called()
+    c.conversations_members.assert_not_called()
+    monkeypatch.delenv('JWT_SECRET_KEY')
+    assert http.get(target, headers=headers).status_code == 503
