@@ -17,6 +17,7 @@ from psycopg2.extras import RealDictCursor
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from slack_sdk.errors import SlackApiError
+from case_announcement_layout import build_parent_text, validate_announcement
 from generate_proposal import (
     generate_proposal as generate_proposal_internal,
     get_case_user_name_by_number,
@@ -761,8 +762,22 @@ def _build_case_announcement_parent_text(
     main_text: str,
     mention_id: str | None,
     case_sheet_url: Any = None,
+    announcement: dict[str, str] | None = None,
+    has_thread: bool = True,
 ) -> str:
-    """案件案内の親投稿本文を組み立てる（担当メンション＋本文＋BPごとの案件紹介シートリンク）。"""
+    """プレビューと送信に共通の親投稿本文を返す。
+
+    Args:
+        main_text: 旧クライアントの本文。
+        mention_id: Speee担当のSlack ID。
+        case_sheet_url: BP別シートURL。
+        announcement: 固定見出しと編集済み3ブロック。Noneは旧形式。
+        has_thread: スレッド返信を投稿するかどうか。
+    Returns:
+        Slackへ送る本文。
+    """
+    if announcement is not None:
+        return build_parent_text(announcement, mention_id, case_sheet_url, has_thread=has_thread)
     lines: list[str] = []
     if mention_id:
         lines.append(f"担当: <@{mention_id}>")
@@ -771,6 +786,38 @@ def _build_case_announcement_parent_text(
     if sheet_url:
         lines.append(f"📄 案件紹介シート: <{sheet_url}|貴社向け案件一覧>")
     return "\n".join(lines)
+
+
+def _preview_case_announcement(payload: Any) -> tuple[dict[str, Any], int]:
+    """BP別の本文を送信せず生成する。
+
+    Args:
+        payload: announcement、担当者、対象BPを含むJSON。
+    Returns:
+        プレビュー一覧とHTTPステータス。
+    """
+    if not isinstance(payload, dict) or not validate_announcement(payload.get("announcement")):
+        return {"error": "announcement の形式が不正です"}, 400
+    targets = payload.get("targets")
+    if not isinstance(targets, list) or not targets or any(not isinstance(t, dict) for t in targets):
+        return {"error": "targets は1件以上必要です"}, 400
+    mention_id = _resolve_case_announcement_mention_id(
+        user_name=payload.get("user_name"), user_slack_id=payload.get("user_slack_id")
+    )
+    return {"previews": [
+        {
+            "bp_id": target.get("bp_id"),
+            "text": _build_case_announcement_parent_text(
+                main_text="", mention_id=mention_id,
+                case_sheet_url=target.get("case_sheet_url"),
+                announcement=payload["announcement"],
+                has_thread=payload.get("has_thread", True),
+            ),
+            "mention_id": mention_id,
+            "user_name": payload.get("user_name") or "",
+        }
+        for target in targets
+    ]}, 200
 
 
 def _slack_error_reason(exc: Exception) -> str:
@@ -816,6 +863,12 @@ def _process_case_announcement(
     2段構成で送信する。client_budget / client_name はBP開示NGのため一切参照しない。
     親投稿のみ成功しスレッド返信に失敗した場合は status='partial'。
     全targetがfailedの場合のみ502。
+
+    Args:
+        client: Slack APIクライアント。
+        payload: 案件・送信先・旧本文または構造化本文。
+    Returns:
+        BP別送信結果とHTTPステータス。
     """
     if not isinstance(payload, dict):
         return {"error": "JSONオブジェクトが必要です"}, 400
@@ -827,7 +880,11 @@ def _process_case_announcement(
 
     if not case_id:
         return {"error": "case_id は必須です"}, 400
-    if not main_text:
+    announcement = payload.get("announcement")
+    if announcement is not None:
+        if not validate_announcement(announcement):
+            return {"error": "announcement の形式が不正です"}, 400
+    elif not main_text:
         return {"error": "main_text は必須です"}, 400
     if not isinstance(targets, list) or not targets:
         return {"error": "targets は1件以上必要です"}, 400
@@ -860,6 +917,8 @@ def _process_case_announcement(
             main_text=main_text,
             mention_id=mention_id,
             case_sheet_url=target.get("case_sheet_url"),
+            announcement=announcement,
+            has_thread=bool(thread_text),
         )
         try:
             post_resp = client.chat_postMessage(channel=channel_id, text=parent_text)
@@ -1451,6 +1510,17 @@ def main() -> None:
             "results": results,
             "skipped_groups": skipped_groups,
         }, 200
+
+    @flask_app.route("/case-announcement/preview", methods=["POST"])
+    def case_announcement_preview():
+        """送信と共通の処理でプレビューを返す。
+
+        Args:
+            なし（JSONボディを参照）。
+        Returns:
+            BP別本文とHTTPステータス。Slack投稿・DB更新は行わない。
+        """
+        return _preview_case_announcement(request.get_json(silent=True))
 
     @flask_app.route("/case-announcement", methods=["POST"])
     def case_announcement():
